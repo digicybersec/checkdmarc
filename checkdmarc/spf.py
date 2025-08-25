@@ -240,10 +240,10 @@ def parse_spf_record(
          - ``errors`` - A ``list`` of errors encountered during parsing
 
     Raises:
-        :exc:`checkdmarc.SPFIncludeLoop`
-        :exc:`checkdmarc.SPFRedirectLoop`
-        :exc:`checkdmarc.SPFSyntaxError`
-        :exc:`checkdmarc.SPFTooManyDNSLookups`
+        :exc:`checkdmarc.spf.SPFIncludeLoop`
+        :exc:`checkdmarc.spf.SPFRedirectLoop`
+        :exc:`checkdmarc.spf.SPFSyntaxError`
+        :exc:`checkdmarc.spf.SPFTooManyDNSLookups`
     """
     logging.debug(f"Parsing the SPF record on {domain}")
     lookup_mechanisms = ["a", "mx", "include", "exists", "redirect"]
@@ -620,11 +620,11 @@ def get_spf_record(
         OrderedDict: An SPF record parsed by result
 
     Raises:
-        :exc:`checkdmarc.SPFRecordNotFound`
-        :exc:`checkdmarc.SPFIncludeLoop`
-        :exc:`checkdmarc.SPFRedirectLoop`
-        :exc:`checkdmarc.SPFSyntaxError`
-        :exc:`checkdmarc.SPFTooManyDNSLookups`
+        :exc:`checkdmarc.spf.SPFRecordNotFound`
+        :exc:`checkdmarc.spf.SPFIncludeLoop`
+        :exc:`checkdmarc.spf.SPFRedirectLoop`
+        :exc:`checkdmarc.spf.SPFSyntaxError`
+        :exc:`checkdmarc.spf.SPFTooManyDNSLookups`
 
     """
     record = query_spf_record(
