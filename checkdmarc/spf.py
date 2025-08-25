@@ -237,6 +237,7 @@ def parse_spf_record(
          - ``dns_lookups`` - Number of DNS lookups required by the record
          - ``parsed`` - An ``OrderedDict`` of a parsed SPF record values
          - ``warnings`` - A ``list`` of warnings
+         - ``errors`` - A ``list`` of errors encountered during parsing
 
     Raises:
         :exc:`checkdmarc.SPFIncludeLoop`
@@ -252,6 +253,7 @@ def parse_spf_record(
         recursion = [domain]
     record = record.replace('" ', "").replace('"', "")
     warnings = []
+    errors = []
     spf_syntax_checker = _SPFGrammar()
     if parked:
         correct_record = "v=spf1 -all"
@@ -291,18 +293,22 @@ def parse_spf_record(
 
     lookup_mechanism_count = 0
     void_lookup_mechanism_count = 0
+    
+    # First pass: count all lookup mechanisms
     for match in matches:
         mechanism = match[1].lower().strip(":=")
         if mechanism in lookup_mechanisms:
             lookup_mechanism_count += 1
+    
+    # Check for too many DNS lookups but don't stop processing
     if lookup_mechanism_count > 10:
-        raise SPFTooManyDNSLookups(
-            "Parsing the SPF record requires "
+        errors.append(
+            f"Parsing the SPF record requires "
             f"{lookup_mechanism_count}/10 maximum DNS lookups - "
-            "https://tools.ietf.org/html/rfc7208#section-4.6.4",
-            dns_lookups=lookup_mechanism_count,
+            "https://tools.ietf.org/html/rfc7208#section-4.6.4"
         )
 
+    # Second pass: process all mechanisms and collect all issues
     for match in matches:
         result = spf_qualifiers[match[0]]
         mechanism = match[1].strip(":=")
@@ -314,21 +320,25 @@ def parse_spf_record(
                     if not isinstance(
                         ipaddress.ip_network(value, strict=False), ipaddress.IPv4Network
                     ):
-                        raise SPFSyntaxError(
+                        errors.append(
                             f"{value} is not a valid ipv4  " "value. Looks like ipv6"
                         )
+                        continue
                 except ValueError:
-                    raise SPFSyntaxError(f"{value} is not a valid ipv4 value")
+                    errors.append(f"{value} is not a valid ipv4 value")
+                    continue
             elif mechanism == "ip6":
                 try:
                     if not isinstance(
                         ipaddress.ip_network(value, strict=False), ipaddress.IPv6Network
                     ):
-                        raise SPFSyntaxError(
+                        errors.append(
                             f"{value} is not a valid ipv6 " "value. Looks like ipv4"
                         )
+                        continue
                 except ValueError:
-                    raise SPFSyntaxError(f"{value} is not a valid ipv6 value")
+                    errors.append(f"{value} is not a valid ipv6 value")
+                    continue
 
             if mechanism == "a":
                 if value == "":
@@ -338,43 +348,61 @@ def parse_spf_record(
                 value = value[0]
                 if len(value) == 2:
                     cidr = value[1]
-                a_records = get_a_records(
-                    value, nameservers=nameservers, resolver=resolver, timeout=timeout
-                )
-                if len(a_records) == 0:
-                    raise _SPFMissingRecords(
-                        f"{value.lower()} does not have any A/AAAA records"
+                try:
+                    a_records = get_a_records(
+                        value, nameservers=nameservers, resolver=resolver, timeout=timeout
                     )
-                for record in a_records:
-                    if cidr:
-                        record = f"{record}/{cidr}"
-                    parsed[result].append(
-                        OrderedDict([("value", record), ("mechanism", mechanism)])
-                    )
+                    if len(a_records) == 0:
+                        warnings.append(
+                            f"{value.lower()} does not have any A/AAAA records"
+                        )
+                        void_lookup_mechanism_count += 1
+                    else:
+                        for record in a_records:
+                            if cidr:
+                                record = f"{record}/{cidr}"
+                            parsed[result].append(
+                                OrderedDict([("value", record), ("mechanism", mechanism)])
+                            )
+                except Exception as e:
+                    warnings.append(f"Error resolving A records for {value}: {str(e)}")
+                    void_lookup_mechanism_count += 1
             elif mechanism == "mx":
                 if value == "":
                     value = domain
-                mx_hosts = get_mx_records(
-                    value, nameservers=nameservers, resolver=resolver, timeout=timeout
-                )
-                if len(mx_hosts) == 0:
-                    raise _SPFMissingRecords(
-                        f"{value.lower()} does not have any MX records"
+                try:
+                    mx_hosts = get_mx_records(
+                        value, nameservers=nameservers, resolver=resolver, timeout=timeout
                     )
-                if len(mx_hosts) > 10:
-                    url = "https://tools.ietf.org/html/rfc7208#section-4.6.4"
-                    raise SPFTooManyDNSLookups(
-                        f"{value} has more than 10 MX records - {url}",
-                        dns_lookups=len(mx_hosts),
-                    )
-                for host in mx_hosts:
-                    hostname = host["hostname"]
-                    parsed[result].append(
-                        OrderedDict([("value", hostname), ("mechanism", mechanism)])
-                    )
+                    if len(mx_hosts) == 0:
+                        warnings.append(
+                            f"{value.lower()} does not have any MX records"
+                        )
+                        void_lookup_mechanism_count += 1
+                    elif len(mx_hosts) > 10:
+                        url = "https://tools.ietf.org/html/rfc7208#section-4.6.4"
+                        errors.append(
+                            f"{value} has more than 10 MX records - {url}"
+                        )
+                        # Still add the records but note the error
+                        for host in mx_hosts:
+                            hostname = host["hostname"]
+                            parsed[result].append(
+                                OrderedDict([("value", hostname), ("mechanism", mechanism)])
+                            )
+                    else:
+                        for host in mx_hosts:
+                            hostname = host["hostname"]
+                            parsed[result].append(
+                                OrderedDict([("value", hostname), ("mechanism", mechanism)])
+                            )
+                except Exception as e:
+                    warnings.append(f"Error resolving MX records for {value}: {str(e)}")
+                    void_lookup_mechanism_count += 1
             elif mechanism == "redirect":
                 if value.lower() in recursion:
-                    raise SPFRedirectLoop(f"Redirect loop: {value.lower()}")
+                    errors.append(f"Redirect loop: {value.lower()}")
+                    continue
                 seen.append(value.lower())
                 try:
                     redirect_record = query_spf_record(
@@ -395,24 +423,25 @@ def parse_spf_record(
                     )
                     lookup_mechanism_count += redirect["dns_lookups"]
                     void_lookup_mechanism_count += redirect["dns_void_lookups"]
+                    
+                    # Check limits but don't stop processing
                     if lookup_mechanism_count > 10:
-                        raise SPFTooManyDNSLookups(
-                            "Parsing the SPF record requires "
+                        errors.append(
+                            f"Parsing the SPF record requires "
                             f"{lookup_mechanism_count}/10 maximum "
                             "DNS lookups - "
                             "https://tools.ietf.org/html/rfc7208"
-                            "#section-4.6.4",
-                            dns_lookups=lookup_mechanism_count,
+                            "#section-4.6.4"
                         )
                     if void_lookup_mechanism_count > 2:
                         u = "https://tools.ietf.org/html/rfc7208#section-4.6.4"
-                        raise SPFTooManyVoidDNSLookups(
-                            "Parsing the SPF record has "
+                        errors.append(
+                            f"Parsing the SPF record has "
                             f"{void_lookup_mechanism_count}/2 maximum void "
                             "DNS lookups - "
-                            f"{u}",
-                            dns_void_lookups=void_lookup_mechanism_count,
+                            f"{u}"
                         )
+                    
                     parsed["redirect"] = OrderedDict(
                         [
                             ("domain", value),
@@ -427,17 +456,24 @@ def parse_spf_record(
                 except DNSException as error:
                     if isinstance(error, DNSExceptionNXDOMAIN):
                         void_lookup_mechanism_count += 1
-                    raise _SPFWarning(str(error))
+                    warnings.append(str(error))
+                except Exception as e:
+                    warnings.append(f"Error processing redirect {value}: {str(e)}")
             elif mechanism == "exp":
-                parsed["exp"] = get_txt_records(value)[0]
+                try:
+                    parsed["exp"] = get_txt_records(value)[0]
+                except Exception as e:
+                    warnings.append(f"Error resolving exp record for {value}: {str(e)}")
             elif mechanism == "all":
                 parsed["all"] = result
             elif mechanism == "include":
                 if value.lower() in recursion:
                     pointer = " -> ".join(recursion + [value.lower()])
-                    raise SPFIncludeLoop(f"Include loop: {pointer}")
+                    errors.append(f"Include loop: {pointer}")
+                    continue
                 if value.lower() in seen:
-                    raise _SPFDuplicateInclude(f"Duplicate include: {value.lower()}")
+                    warnings.append(f"Duplicate include: {value.lower()}")
+                    continue
                 seen.append(value.lower())
                 if "%{" in value:
                     include = OrderedDict([("domain", value)])
@@ -462,24 +498,25 @@ def parse_spf_record(
                     )
                     lookup_mechanism_count += include["dns_lookups"]
                     void_lookup_mechanism_count += include["dns_void_lookups"]
+                    
+                    # Check limits but don't stop processing
                     if lookup_mechanism_count > 10:
-                        raise SPFTooManyDNSLookups(
-                            "Parsing the SPF record requires "
+                        errors.append(
+                            f"Parsing the SPF record requires "
                             f"{lookup_mechanism_count}/10 maximum "
                             "DNS lookups - "
                             "https://tools.ietf.org/html/rfc7208"
-                            "#section-4.6.4",
-                            dns_lookups=lookup_mechanism_count,
+                            "#section-4.6.4"
                         )
                     if void_lookup_mechanism_count > 2:
                         u = "https://tools.ietf.org/html/rfc7208#section-4.6.4"
-                        raise SPFTooManyVoidDNSLookups(
-                            "Parsing the SPF record has "
+                        errors.append(
+                            f"Parsing the SPF record has "
                             f"{void_lookup_mechanism_count}/2 maximum void "
                             "DNS lookups - "
-                            f"{u}",
-                            dns_void_lookups=void_lookup_mechanism_count,
+                            f"{u}"
                         )
+                    
                     include = OrderedDict(
                         [
                             ("domain", value),
@@ -496,15 +533,17 @@ def parse_spf_record(
                 except DNSException as error:
                     if isinstance(error, DNSExceptionNXDOMAIN):
                         void_lookup_mechanism_count += 1
-                    raise _SPFWarning(str(error))
+                    warnings.append(str(error))
                 except SPFRecordNotFound as error:
                     void_lookup_mechanism_count += 1
-                    raise error
+                    warnings.append(str(error))
+                except Exception as e:
+                    warnings.append(f"Error processing include {value}: {str(e)}")
             elif mechanism == "ptr":
                 parsed[result].append(
                     OrderedDict([("value", value), ("mechanism", mechanism)])
                 )
-                raise _SPFWarning(
+                warnings.append(
                     "The ptr mechanism should not be used - "
                     "https://tools.ietf.org/html/rfc7208"
                     "#section-5.5"
@@ -514,20 +553,23 @@ def parse_spf_record(
 
                 for token in tokens:
                     if token not in ["all", "e", "f", "s", "n"]:
-                        raise SPFSyntaxError(
+                        errors.append(
                             f"{token} is not a valid token for the rr tag"
                         )
+                        continue
 
                 parsed["rr"] = result
             elif mechanism == "rp":
                 if not value.isdigit():
-                    raise SPFSyntaxError(
+                    errors.append(
                         f"{value} is not a valid ra tag value - should be a number"
                     )
+                    continue
                 if int(value) < 0 or int(value) > 100:
-                    raise SPFSyntaxError(
+                    errors.append(
                         f"{value} is not a valid ra tag value - should be a number between 0 and 100"
                     )
+                    continue
 
                 parsed["rp"] = result
             else:
@@ -535,24 +577,25 @@ def parse_spf_record(
                     OrderedDict([("value", value), ("mechanism", mechanism)])
                 )
 
-        except (_SPFWarning, DNSException) as warning:
-            if isinstance(warning, (_SPFMissingRecords, DNSExceptionNXDOMAIN)):
-                void_lookup_mechanism_count += 1
-                if void_lookup_mechanism_count > 2:
-                    raise SPFTooManyVoidDNSLookups(
-                        "Parsing the SPF record has "
-                        f"{void_lookup_mechanism_count}/2 maximum void DNS "
-                        "lookups - "
-                        "https://tools.ietf.org/html/rfc7208#section-4.6.4",
-                        dns_void_lookups=void_lookup_mechanism_count,
-                    )
+        except Exception as warning:
             warnings.append(str(warning))
+    
+    # Check void lookup limits at the end
+    if void_lookup_mechanism_count > 2:
+        errors.append(
+            f"Parsing the SPF record has "
+            f"{void_lookup_mechanism_count}/2 maximum void DNS "
+            "lookups - "
+            "https://tools.ietf.org/html/rfc7208#section-4.6.4"
+        )
+    
     return OrderedDict(
         [
             ("dns_lookups", lookup_mechanism_count),
             ("dns_void_lookups", void_lookup_mechanism_count),
             ("parsed", parsed),
             ("warnings", warnings),
+            ("errors", errors),
         ]
     )
 
@@ -623,11 +666,12 @@ def check_spf(
                        - ``dns_void_lookups`` - The number of void DNS lookups
                        - ``valid`` - True
                        - ``warnings`` - A ``list`` of warnings
+                       - ``errors`` - A ``list`` of errors (if any)
 
                     If a DNS error occurs, the dictionary will have the
                     following keys:
 
-                      - ``error`` - Tne error message
+                      - ``error`` - The error message
                       - ``valid`` - False
     """
     spf_results = OrderedDict(
@@ -636,6 +680,7 @@ def check_spf(
             ("valid", True),
             ("dns_lookups", None),
             ("dns_void_lookups", None),
+            ("errors", []),
         ]
     )
     try:
@@ -657,6 +702,14 @@ def check_spf(
         spf_results["dns_void_lookups"] = parsed_spf["dns_void_lookups"]
         spf_results["parsed"] = parsed_spf["parsed"]
         spf_results["warnings"] += parsed_spf["warnings"]
+        
+        # Add any errors from parsing
+        if "errors" in parsed_spf and parsed_spf["errors"]:
+            spf_results["errors"] = parsed_spf["errors"]
+            # If there are errors, mark as invalid but still return the parsed data
+            if parsed_spf["errors"]:
+                spf_results["valid"] = False
+                
     except SPFError as error:
         spf_results["error"] = str(error.args[0])
         del spf_results["dns_lookups"]
